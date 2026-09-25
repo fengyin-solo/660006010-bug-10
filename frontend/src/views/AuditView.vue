@@ -5,24 +5,30 @@
       <textarea v-model="contractCode" class="code-editor" placeholder="// 粘贴 Solidity 合约代码..."></textarea>
       <div class="toolbar">
         <input v-model="filename" placeholder="文件名.sol" class="filename-input" />
-        <button @click="runAudit" class="btn-primary" :disabled="!contractCode">
+        <button @click="runAudit" class="btn-primary" :disabled="!contractCode || isAuditing">
           {{ isAuditing ? "审计中..." : "开始审计" }}
         </button>
+      </div>
+      <div v-if="errorMessage" class="error-banner">
+        <span>审计失败：{{ errorMessage }}</span>
+        <button class="btn-retry" @click="runAudit">重试</button>
       </div>
     </div>
     <div v-if="result" class="result-section">
       <div class="score-card" :class="scoreClass">
         <div class="score-label">安全评分</div>
         <div class="score-value">{{ result.score }}</div>
-        <div class="score-grade">{{ scoreGrade }}</div>
+        <div class="score-grade">{{ result.grade || scoreGrade }}</div>
       </div>
       <div class="vulnerabilities">
         <h3>发现漏洞 ({{ result.vulnerabilities.length }})</h3>
-        <div v-for="v in result.vulnerabilities" :key="v.line + v.type" class="vuln-card" :class="v.severity">
+        <div v-for="(v, i) in result.vulnerabilities" :key="i" class="vuln-card" :class="v.severity">
           <div class="vuln-header">
             <span class="vuln-type">{{ v.type }}</span>
             <span class="vuln-severity">{{ v.severity }}</span>
           </div>
+          <div class="vuln-line">第 {{ v.line }} 行</div>
+          <pre v-if="v.code" class="vuln-code">{{ v.code }}</pre>
           <div class="vuln-desc">{{ v.description }}</div>
           <div class="vuln-suggest">建议: {{ v.suggestion }}</div>
         </div>
@@ -41,17 +47,20 @@
 
 <script setup lang="ts">
 import { ref, computed } from "vue"
+import { useAuditStore } from "../store"
+
+const store = useAuditStore()
 
 const contractCode = ref(`// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
 contract SimpleBank {
     mapping(address => uint) public balances;
-    
+
     function deposit() public payable {
         balances[msg.sender] += msg.value;
     }
-    
+
     function withdraw(uint amount) public {
         require(balances[msg.sender] >= amount);
         (bool success,) = msg.sender.call{value: amount}("");
@@ -61,6 +70,7 @@ contract SimpleBank {
 }`)
 const filename = ref("SimpleBank.sol")
 const isAuditing = ref(false)
+const errorMessage = ref("")
 const result = ref<any>(null)
 
 const scoreClass = computed(() => {
@@ -80,38 +90,14 @@ const scoreGrade = computed(() => {
 
 async function runAudit() {
   isAuditing.value = true
-  await new Promise(r => setTimeout(r, 1500))
-  
-  // Simulate vulnerability detection
-  const vulns = []
-  if (contractCode.value.includes("msg.sender.call")) {
-    vulns.push({
-      type: "重入攻击 (Reentrancy)",
-      severity: "critical",
-      line: contractCode.value.split("\n").findIndex(l => l.includes("msg.sender.call")) + 1,
-      description: "使用了低级的 call() 接收ETH，存在重入攻击风险。攻击者可通过恶意合约反复调用提款函数。",
-      suggestion: "使用 Checks-Effects-Interactions 模式，或使用 ReentrancyGuard 修饰符。"
-    })
+  errorMessage.value = ""
+  try {
+    result.value = await store.uploadAndAudit(contractCode.value, filename.value || "contract.sol")
+  } catch (e: any) {
+    errorMessage.value = e?.response?.data?.detail || e?.message || "网络错误"
+  } finally {
+    isAuditing.value = false
   }
-  if (contractCode.value.includes("require(balances")) {
-    vulns.push({
-      type: "整数溢出 (Integer Overflow)",
-      severity: "high",
-      line: 1,
-      description: "Solidity 0.8以下版本未启用溢出检查，需注意。",
-      suggestion: "使用 SafeMath 库或在 Solidity 0.8+ 环境中编译。"
-    })
-  }
-  
-  result.value = {
-    score: vulns.length === 0 ? 95 : Math.max(20, 85 - vulns.length * 25),
-    vulnerabilities: vulns,
-    gasIssues: [
-      { functionName: "deposit()", currentGas: 45000, optimizedGas: 21000, suggestion: "移除不必要的存储写入" },
-      { functionName: "withdraw()", currentGas: 52000, optimizedGas: 31000, suggestion: "使用 local 变量缓存 balances[msg.sender]" }
-    ]
-  }
-  isAuditing.value = false
 }
 </script>
 
@@ -122,6 +108,8 @@ async function runAudit() {
 .filename-input { padding: 0.5rem 1rem; border: 1px solid #d1d5db; border-radius: 8px; flex: 1; }
 .btn-primary { background: #8b5cf6; color: white; border: none; padding: 0.625rem 1.5rem; border-radius: 8px; cursor: pointer; white-space: nowrap; }
 .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+.error-banner { display: flex; align-items: center; justify-content: space-between; gap: 1rem; background: #fee2e2; color: #991b1b; border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; }
+.btn-retry { background: #dc2626; color: white; border: none; padding: 0.375rem 1rem; border-radius: 6px; cursor: pointer; }
 .result-section { margin-top: 2rem; }
 .score-card { border-radius: 16px; padding: 2rem; text-align: center; color: white; margin-bottom: 2rem; }
 .score-high { background: linear-gradient(135deg, #10b981, #059669); }
@@ -136,9 +124,11 @@ async function runAudit() {
 .vuln-card.high { border-color: #f59e0b; }
 .vuln-card.medium { border-color: #3b82f6; }
 .vuln-card.low { border-color: #6b7280; }
-.vuln-header { display: flex; justify-content: space-between; margin-bottom: 0.75rem; }
+.vuln-header { display: flex; justify-content: space-between; margin-bottom: 0.5rem; }
 .vuln-type { font-weight: 600; }
 .vuln-severity { padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.75rem; background: #fee2e2; color: #dc2626; }
+.vuln-line { font-size: 0.75rem; color: #7c3aed; margin-bottom: 0.5rem; font-family: monospace; }
+.vuln-code { background: #1e1e1e; color: #d4d4d4; font-family: "Fira Code", monospace; font-size: 0.75rem; padding: 0.75rem; border-radius: 6px; overflow-x: auto; margin-bottom: 0.75rem; }
 .vuln-desc { color: #374151; margin-bottom: 0.5rem; }
 .vuln-suggest { font-size: 0.875rem; color: #6b7280; }
 .gas-card { background: white; border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem; }
